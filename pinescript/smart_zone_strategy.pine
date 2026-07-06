@@ -284,6 +284,10 @@ if barstate.isconfirmed
         dayStartEquity := strategy.equity
         signalsToday := 0
 
+    // Umur sejak BOS terakhir (dipakai skor confidence) — wajib di-increment
+    barsSinceBreakUp := math.min(barsSinceBreakUp + 1, 9999)
+    barsSinceBreakDn := math.min(barsSinceBreakDn + 1, 9999)
+
     // ---- 5b. Deteksi posisi sudah flat → bersihkan state ----------------------
     if trDir != 0 and strategy.position_size == 0 and bar_index > lastSignalBar
         trDir := 0

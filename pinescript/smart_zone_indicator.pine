@@ -547,15 +547,14 @@ if barstate.isconfirmed
 // =============================================================================
 //  6. ALERT DINI ZONA (opsional, boleh intrabar — hanya info, bukan sinyal)
 // =============================================================================
-zoneTouchBuy  = alertZoneTouch and masterEnable and enableBuy and activeDir == 0 and not na(f_findDemand())
-zoneTouchSell = alertZoneTouch and masterEnable and enableSell and activeDir == 0 and not na(f_findSupply())
+// Scan zona sekali per sisi lalu dipakai ulang (hindari scan array ganda per tick)
+Zone ztBuy  = alertZoneTouch and masterEnable and enableBuy and activeDir == 0 ? f_findDemand() : na
+Zone ztSell = alertZoneTouch and masterEnable and enableSell and activeDir == 0 ? f_findSupply() : na
 
-if zoneTouchBuy
-    Zone zt = f_findDemand()
-    alert('{"type":"ZONE_TOUCH","side":"BUY","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","zone_top":"' + str.tostring(zt.top, format.mintick) + '","zone_bottom":"' + str.tostring(zt.bot, format.mintick) + '","time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssZ", "UTC") + '"' + (webhookSecret != "" ? ',"secret":"' + webhookSecret + '"' : "") + "}", alert.freq_once_per_bar)
-if zoneTouchSell
-    Zone zt = f_findSupply()
-    alert('{"type":"ZONE_TOUCH","side":"SELL","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","zone_top":"' + str.tostring(zt.top, format.mintick) + '","zone_bottom":"' + str.tostring(zt.bot, format.mintick) + '","time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssZ", "UTC") + '"' + (webhookSecret != "" ? ',"secret":"' + webhookSecret + '"' : "") + "}", alert.freq_once_per_bar)
+if not na(ztBuy)
+    alert('{"type":"ZONE_TOUCH","side":"BUY","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","zone_top":"' + str.tostring(ztBuy.top, format.mintick) + '","zone_bottom":"' + str.tostring(ztBuy.bot, format.mintick) + '","time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssZ", "UTC") + '"' + (webhookSecret != "" ? ',"secret":"' + webhookSecret + '"' : "") + "}", alert.freq_once_per_bar)
+if not na(ztSell)
+    alert('{"type":"ZONE_TOUCH","side":"SELL","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","zone_top":"' + str.tostring(ztSell.top, format.mintick) + '","zone_bottom":"' + str.tostring(ztSell.bot, format.mintick) + '","time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssZ", "UTC") + '"' + (webhookSecret != "" ? ',"secret":"' + webhookSecret + '"' : "") + "}", alert.freq_once_per_bar)
 
 // =============================================================================
 //  7. PLOT EMA

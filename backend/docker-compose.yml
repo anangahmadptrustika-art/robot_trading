@@ -1,0 +1,46 @@
+# =============================================================================
+#  Smart Zone Trading Bot — deploy semi-auto (backend + Caddy auto-HTTPS)
+# -----------------------------------------------------------------------------
+#  Cara pakai (di VPS ber-IP publik, domain sudah mengarah ke IP tsb):
+#    1. cp .env.example .env   lalu isi WEBHOOK_SECRET, ADMIN_TOKEN, Telegram,
+#       dan tambahkan baris:  DOMAIN=namadomain.anda.com
+#    2. docker compose up -d --build
+#  Caddy otomatis menerbitkan sertifikat TLS (Let's Encrypt) untuk DOMAIN.
+#  Webhook TradingView diarahkan ke:  https://DOMAIN/webhook/tradingview
+# =============================================================================
+services:
+  backend:
+    build: .
+    # Semua setting aplikasi diambil dari .env (secret TIDAK di-bake ke image).
+    env_file: .env
+    environment:
+      # DB disimpan di named volume agar persisten lintas restart/rebuild.
+      DATABASE_URL: sqlite:////app/data/szt_signals.db
+      # Backend berada di belakang Caddy, jadi percayai header X-Forwarded-For
+      # supaya rate-limit & allowlist melihat IP klien sebenarnya.
+      TRUST_PROXY_HEADERS: "true"
+    volumes:
+      - szt-data:/app/data
+    expose:
+      - "8000"          # hanya internal ke jaringan compose, tidak ke publik
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN di .env, mis. DOMAIN=bot.contoh.com}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data      # simpan sertifikat TLS (persisten)
+      - caddy-config:/config
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  szt-data:
+  caddy-data:
+  caddy-config:

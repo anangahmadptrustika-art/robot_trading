@@ -1,0 +1,14 @@
+# Dependensi PRODUKSI backend Smart Zone Trading Bot (dibaca Vercel & Docker).
+fastapi>=0.111,<1.0
+uvicorn>=0.30            # dipakai Docker/lokal; tidak dipakai Vercel (harmless)
+pydantic>=2.7,<3
+pydantic-settings>=2.3,<3
+SQLAlchemy>=2.0,<3
+httpx>=0.27
+# Driver Postgres untuk deploy serverless (Vercel Postgres/Neon/Supabase).
+# Tidak dipakai saat DATABASE_URL memakai SQLite lokal.
+psycopg[binary]>=3.1
+
+# CATATAN: ccxt SENGAJA tidak ada di sini. Live trading hanyalah template;
+# pasang manual dengan 'pip install ccxt' hanya jika Anda sadar risikonya.
+# Dependensi pengembangan/test ada di requirements-dev.txt.

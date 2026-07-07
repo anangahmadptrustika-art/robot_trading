@@ -1,0 +1,601 @@
+//@version=6
+// =============================================================================
+//  SMART ZONE TRADING BOT [SZT] — MODE INDICATOR — v1.0
+// -----------------------------------------------------------------------------
+//  Sistem analisis chart otomatis untuk TradingView:
+//    • Market structure : HH / HL / LH / LL, BOS, CHoCH, deteksi trend
+//    • Zona entry       : order block sederhana + S/R pivot + premium/discount
+//    • Konfirmasi entry : candle rejection / engulfing + filter EMA/ATR/Vol/RSI
+//    • Risk management  : SL berbasis swing/ATR, TP1 & TP2 berbasis risk-reward
+//    • Alert webhook    : payload JSON siap dikirim ke backend (folder backend/)
+//
+//  ANTI-REPAINT — baca ini dulu:
+//    1. Semua sinyal dievaluasi HANYA pada candle yang sudah CLOSE
+//       (barstate.isconfirmed). Sinyal yang sudah tampil tidak akan hilang.
+//    2. Pivot (swing high/low) butuh `pivotLen` bar konfirmasi. Artinya label
+//       struktur muncul TERLAMBAT `pivotLen` bar — ini trade-off yang benar:
+//       terlambat tapi PASTI, bukan cepat tapi berubah-ubah.
+//    3. Break of Structure diukur terhadap pivot yang SUDAH terkonfirmasi,
+//       memakai harga CLOSE (bukan wick).
+//    4. Filter multi-timeframe memakai nilai bar HTF yang sudah close
+//       (pola request.security anti-lookahead).
+//
+//  DISCLAIMER: Ini alat bantu analisis & manajemen risiko, BUKAN jaminan
+//  profit. Wajib backtest (file strategy) + paper trading sebelum dana riil.
+// =============================================================================
+indicator("Smart Zone Trading Bot [SZT]", "SZT Bot v1", overlay = true, max_boxes_count = 100, max_lines_count = 200, max_labels_count = 200)
+
+// =============================================================================
+//  1. INPUT
+// =============================================================================
+G_MASTER = "⚙️  Master"
+G_STRUCT = "🏗️  Market Structure"
+G_TREND  = "📈  Filter Trend"
+G_ZONE   = "🎯  Zona Entry"
+G_ENTRY  = "✅  Validasi Entry"
+G_RISK   = "🛡️  Risk Management"
+G_MTF    = "🕐  Multi-Timeframe & Sesi"
+G_ALERT  = "🔔  Alert & Webhook"
+G_VIS    = "🎨  Tampilan"
+
+// --- Master / kill switch --------------------------------------------------
+masterEnable  = input.bool(true,  "Bot aktif (kill switch)",  group = G_MASTER, tooltip = "Matikan untuk menghentikan SEMUA sinyal & alert tanpa menghapus indikator.")
+enableBuy     = input.bool(true,  "Aktifkan sinyal BUY",       group = G_MASTER)
+enableSell    = input.bool(true,  "Aktifkan sinyal SELL",      group = G_MASTER)
+
+// --- Market structure --------------------------------------------------------
+pivotLen      = input.int(5,   "Panjang pivot (kiri & kanan)", minval = 2, maxval = 20, group = G_STRUCT, tooltip = "Semakin besar = struktur semakin mayor, tapi konfirmasi pivot semakin terlambat (anti-repaint).")
+obLookback    = input.int(15,  "Lookback order block",         minval = 3, maxval = 50, group = G_STRUCT, tooltip = "Berapa bar ke belakang mencari candle asal (order block) saat terjadi BOS/CHoCH.")
+maxZones      = input.int(6,   "Maksimal zona per sisi",       minval = 1, maxval = 15, group = G_STRUCT)
+
+// --- Filter trend -------------------------------------------------------------
+emaFastLen    = input.int(50,   "EMA cepat",  minval = 5,  group = G_TREND)
+emaSlowLen    = input.int(200,  "EMA lambat", minval = 20, group = G_TREND)
+atrLen        = input.int(14,   "Periode ATR", minval = 1, group = G_TREND)
+flatBars      = input.int(10,   "Bar pengukur kemiringan EMA", minval = 3, group = G_TREND)
+flatThreshAtr = input.float(0.4, "Ambang EMA datar (x ATR)", minval = 0.0, step = 0.1, group = G_TREND, tooltip = "Jika pergerakan EMA cepat selama N bar < ambang ini (dalam ATR), market dianggap SIDEWAYS.")
+useVolFilter  = input.bool(true,  "Filter volume (vol > MA volume)", group = G_TREND)
+volMaLen      = input.int(20,  "Periode MA volume", minval = 1, group = G_TREND)
+useRsiFilter  = input.bool(false, "Filter RSI overbought/oversold", group = G_TREND)
+rsiLen        = input.int(14, "Periode RSI", minval = 2, group = G_TREND)
+rsiOb         = input.float(70, "RSI overbought", minval = 50, maxval = 100, group = G_TREND)
+rsiOs         = input.float(30, "RSI oversold",  minval = 0,  maxval = 50,  group = G_TREND)
+
+// --- Zona entry ---------------------------------------------------------------
+usePremDisc   = input.bool(true, "Pakai premium/discount sebagai confluence", group = G_ZONE, tooltip = "Long lebih dipercaya di area discount (bawah equilibrium), short di area premium.")
+allowRange    = input.bool(false, "Izinkan range trading saat sideways", group = G_ZONE, tooltip = "Default MATI: tidak entry saat market sideways. Nyalakan hanya jika ingin trading pantulan range.")
+
+// --- Validasi entry -------------------------------------------------------------
+slMode        = input.string("Swing + Buffer ATR", "Mode stop loss", options = ["Swing + Buffer ATR", "ATR Murni"], group = G_ENTRY)
+swingBufAtr   = input.float(0.3, "Buffer SL di bawah/atas swing (x ATR)", minval = 0.0, step = 0.1, group = G_ENTRY)
+slAtrMult     = input.float(1.5, "Jarak SL mode ATR murni (x ATR)", minval = 0.1, step = 0.1, group = G_ENTRY)
+maxSlAtrMult  = input.float(3.0, "SL maksimal (x ATR) — lebih jauh = sinyal batal", minval = 0.5, step = 0.1, group = G_ENTRY)
+tp1RR         = input.float(1.5, "TP1 (x risiko)", minval = 0.5, step = 0.1, group = G_ENTRY)
+tp2RR         = input.float(2.0, "TP2 (x risiko)", minval = 1.0, step = 0.1, group = G_ENTRY)
+minRR         = input.float(2.0, "Minimal RR ke struktur berlawanan", minval = 0.5, step = 0.1, group = G_ENTRY, tooltip = "Sinyal batal jika jarak ke swing berlawanan terdekat < minRR x risiko (TP terhalang struktur).")
+minAtrPct     = input.float(0.01, "ATR minimal (% dari harga)", minval = 0.0, step = 0.01, group = G_ENTRY, tooltip = "Jangan entry saat volatilitas terlalu kecil.")
+maxCandleAtr  = input.float(2.5, "Candle sinyal maksimal (x ATR)", minval = 0.5, step = 0.1, group = G_ENTRY, tooltip = "Jangan entry jika candle konfirmasi terlalu besar (entry sudah terlambat).")
+lateAtrMult   = input.float(1.0, "Jarak close maksimal dari zona (x ATR)", minval = 0.1, step = 0.1, group = G_ENTRY, tooltip = "Jangan kejar harga yang sudah lari jauh dari zona.")
+
+// --- Risk management -------------------------------------------------------------
+capital       = input.float(10000, "Modal akun", minval = 1, group = G_RISK)
+riskPct       = input.float(1.0, "Risiko per trade (%)", minval = 0.05, maxval = 5, step = 0.05, group = G_RISK)
+maxSignalsDay = input.int(5, "Maksimal sinyal per hari", minval = 1, maxval = 50, group = G_RISK)
+cooldownBars  = input.int(5, "Jeda minimal antar sinyal (bar)", minval = 0, group = G_RISK)
+timeoutBars   = input.int(96, "Sinyal kadaluarsa setelah (bar)", minval = 10, group = G_RISK, tooltip = "Jika belum kena SL/TP setelah sekian bar, status sinyal jadi EXPIRED dan bot boleh cari sinyal baru.")
+tradeProfile  = input.string("Balanced", "Profil trading", options = ["Conservative", "Balanced", "Aggressive"], group = G_RISK, tooltip = "Conservative: hanya sinyal confidence ≥ 75. Balanced: ≥ 60. Aggressive: ≥ 45.")
+
+// --- MTF & sesi -----------------------------------------------------------------
+useMtf        = input.bool(false, "Konfirmasi multi-timeframe", group = G_MTF)
+mtfTf         = input.timeframe("240", "Timeframe konfirmasi", group = G_MTF)
+useSession    = input.bool(false, "Filter sesi trading", group = G_MTF)
+sessionStr    = input.session("0700-2100", "Sesi aktif", group = G_MTF)
+sessionTz     = input.string("", "Timezone sesi (kosong = timezone exchange)", group = G_MTF, tooltip = "Contoh: Asia/Jakarta, UTC, America/New_York")
+
+// --- Alert -----------------------------------------------------------------------
+alertZoneTouch = input.bool(false, "Alert dini saat harga MASUK zona (intrabar)", group = G_ALERT, tooltip = "Peringatan awal sebelum konfirmasi close. Sinyal utama tetap menunggu candle close (anti-repaint).")
+webhookSecret  = input.string("", "Webhook secret (samakan dengan backend)", group = G_ALERT, tooltip = "Disisipkan ke payload JSON sebagai field \"secret\". Backend menolak alert tanpa secret yang benar.")
+
+// --- Tampilan ----------------------------------------------------------------------
+showZones     = input.bool(true, "Tampilkan zona entry",        group = G_VIS)
+showSR        = input.bool(true, "Tampilkan garis S/R pivot",   group = G_VIS)
+showStruct    = input.bool(true, "Tampilkan label struktur & BOS/CHoCH", group = G_VIS)
+showEmas      = input.bool(true, "Tampilkan EMA 50 & 200",      group = G_VIS)
+showPanel     = input.bool(true, "Tampilkan panel dashboard",   group = G_VIS)
+panelPosInp   = input.string("Kanan Atas", "Posisi panel", options = ["Kanan Atas", "Kanan Bawah", "Kiri Atas", "Kiri Bawah"], group = G_VIS)
+lineExtend    = input.int(20, "Panjang garis sinyal (bar)", minval = 5, maxval = 100, group = G_VIS)
+colBull       = input.color(#089981, "Warna bullish", group = G_VIS)
+colBear       = input.color(#f23645, "Warna bearish", group = G_VIS)
+colEntryLn    = input.color(#2962ff, "Warna garis entry", group = G_VIS)
+
+// =============================================================================
+//  2. TIPE DATA & VARIABEL GLOBAL
+// =============================================================================
+type Zone
+    box   bx
+    float top
+    float bot
+    bool  active
+    bool  used
+
+var demandZones = array.new<Zone>()
+var supplyZones = array.new<Zone>()
+var srLines     = array.new<line>()
+var structLines = array.new<line>()
+var pivotLabels = array.new<label>()
+var structLabels = array.new<label>()
+var sigLines    = array.new<line>()
+var sigLabels   = array.new<label>()
+
+// Struktur pasar (semua hanya diubah pada bar yang sudah close)
+var float lastSwingHigh    = na
+var float prevSwingHigh    = na
+var int   lastSwingHighBar = na
+var float lastSwingLow     = na
+var float prevSwingLow     = na
+var int   lastSwingLowBar  = na
+var bool  highTaken        = false    // swing high terakhir sudah ditembus?
+var bool  lowTaken         = false
+var int   structTrend      = 0        // 1 bull, -1 bear, 0 netral
+var int   barsSinceBreakUp = 9999
+var int   barsSinceBreakDn = 9999
+
+// Sinyal aktif (untuk tracking status & panel)
+var int    activeDir  = 0             // 1 long, -1 short, 0 tidak ada
+var float  actEntry   = na
+var float  actSL      = na
+var float  actTP1     = na
+var float  actTP2     = na
+var float  actQty     = na
+var int    actConf    = 0
+var int    actBar     = na
+var string actSide    = "-"
+var string actStatus  = "MENUNGGU"
+var string actTime    = "-"
+var int    signalsToday  = 0
+var int    lastSignalBar = -99999
+
+// =============================================================================
+//  3. KALKULASI SERIES (selalu di scope global agar konsisten — anti-repaint)
+// =============================================================================
+atrVal  = ta.atr(atrLen)
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+volMa   = ta.sma(volume, volMaLen)
+rsiVal  = ta.rsi(close, rsiLen)
+ph      = ta.pivothigh(high, pivotLen, pivotLen)
+pl      = ta.pivotlow(low, pivotLen, pivotLen)
+newDay  = ta.change(time("D")) != 0
+
+// Filter multi-timeframe: pakai nilai bar HTF yang SUDAH close ([1] +
+// lookahead_on = pola standar anti-repaint; tanpa data masa depan).
+f_trendHtf() =>
+    fastH = ta.ema(close, emaFastLen)
+    slowH = ta.ema(close, emaSlowLen)
+    fastH[1] > slowH[1] ? 1 : fastH[1] < slowH[1] ? -1 : 0
+mtfTrendRaw = request.security(syminfo.tickerid, mtfTf, f_trendHtf(), lookahead = barmerge.lookahead_on)
+mtfTrend    = useMtf ? mtfTrendRaw : 0
+
+// Sesi trading
+sessTz    = sessionTz == "" ? syminfo.timezone : sessionTz
+inSession = not useSession or not na(time(timeframe.period, sessionStr, sessTz))
+
+// Trend gabungan: struktur + EMA + deteksi datar (sideways)
+emaFlat    = math.abs(emaFast - emaFast[flatBars]) < flatThreshAtr * atrVal
+emaTrendD  = emaFast > emaSlow ? 1 : emaFast < emaSlow ? -1 : 0
+trendDir   = emaFlat ? 0 : structTrend == 1 and emaTrendD == 1 ? 1 : structTrend == -1 and emaTrendD == -1 ? -1 : 0
+trendText  = trendDir == 1 ? "BULLISH" : trendDir == -1 ? "BEARISH" : "SIDEWAYS"
+
+// Premium / discount berdasarkan range swing terkonfirmasi terakhir
+eqLevel = (nz(lastSwingHigh, high) + nz(lastSwingLow, low)) / 2
+
+// Anatomi candle konfirmasi (rejection / momentum / engulfing)
+rng            = high - low
+bullBody       = close > open
+bearBody       = close < open
+strongCloseBull = rng > 0 and (close - low) / rng >= 0.65
+strongCloseBear = rng > 0 and (high - close) / rng >= 0.65
+wickBull       = rng > 0 and (math.min(open, close) - low) / rng >= 0.4
+wickBear       = rng > 0 and (high - math.max(open, close)) / rng >= 0.4
+engulfBull     = bullBody and close[1] < open[1] and close >= open[1] and open <= close[1]
+engulfBear     = bearBody and close[1] > open[1] and close <= open[1] and open >= close[1]
+confirmBull    = bullBody and (strongCloseBull or wickBull or engulfBull)
+confirmBear    = bearBody and (strongCloseBear or wickBear or engulfBear)
+
+// Filter validasi umum (dipakai sinyal & ditampilkan di panel)
+atrPctVal = close > 0 ? atrVal / close * 100 : 0.0
+atrOk     = atrPctVal >= minAtrPct
+candleOk  = rng <= maxCandleAtr * atrVal
+volOk     = not useVolFilter or na(volume) or volume > volMa
+trendVis  = not emaFlat
+confThreshold = tradeProfile == "Conservative" ? 75 : tradeProfile == "Balanced" ? 60 : 45
+riskMoney = capital * riskPct / 100
+
+// =============================================================================
+//  4. FUNGSI BANTU
+// =============================================================================
+// Simpan drawing dengan batas jumlah agar chart tetap ringan
+f_pushLine(array<line> arr, line ln, int cap) =>
+    array.push(arr, ln)
+    if array.size(arr) > cap
+        line.delete(array.shift(arr))
+
+f_pushLabel(array<label> arr, label lb, int cap) =>
+    array.push(arr, lb)
+    if array.size(arr) > cap
+        label.delete(array.shift(arr))
+
+// Apakah rentang harga menimpa zona aktif yang sudah ada?
+f_overlaps(array<Zone> zArr, float top, float bot) =>
+    bool res = false
+    if array.size(zArr) > 0
+        for i = 0 to array.size(zArr) - 1
+            Zone z = array.get(zArr, i)
+            if z.active and not (bot > z.top or top < z.bot)
+                res := true
+                break
+    res
+
+// Buat zona baru + jaga jumlah maksimal
+f_makeZone(array<Zone> zArr, float top, float bot, int srcBar, bool isDemand) =>
+    color hidden = color.new(color.gray, 100)
+    color bg  = isDemand ? color.new(colBull, 85) : color.new(colBear, 85)
+    color brd = isDemand ? color.new(colBull, 55) : color.new(colBear, 55)
+    box bx = box.new(srcBar, top, bar_index + 3, bot, border_color = showZones ? brd : hidden, border_width = 1, bgcolor = showZones ? bg : hidden)
+    array.push(zArr, Zone.new(bx, top, bot, true, false))
+    if array.size(zArr) > maxZones
+        Zone old = array.shift(zArr)
+        box.delete(old.bx)
+
+// Cari zona demand yang sedang disentuh harga (yang terbaru lebih dulu)
+f_findDemand() =>
+    Zone res = na
+    int n = array.size(demandZones)
+    if n > 0
+        for i = n - 1 to 0
+            Zone z = array.get(demandZones, i)
+            if z.active and not z.used and low <= z.top and close >= z.bot
+                res := z
+                break
+    res
+
+f_findSupply() =>
+    Zone res = na
+    int n = array.size(supplyZones)
+    if n > 0
+        for i = n - 1 to 0
+            Zone z = array.get(supplyZones, i)
+            if z.active and not z.used and high >= z.bot and close <= z.top
+                res := z
+                break
+    res
+
+// Payload JSON untuk webhook (format sesuai kontrak backend)
+f_json(string _sig, float _entry, float _sl, float _tp1, float _tp2, float _rr, string _trend, int _conf, float _qty) =>
+    string j = '{"symbol":"' + syminfo.ticker + '"'
+    j += ',"timeframe":"' + timeframe.period + '"'
+    j += ',"signal":"' + _sig + '"'
+    j += ',"entry":"' + str.tostring(_entry, format.mintick) + '"'
+    j += ',"stop_loss":"' + str.tostring(_sl, format.mintick) + '"'
+    j += ',"take_profit_1":"' + str.tostring(_tp1, format.mintick) + '"'
+    j += ',"take_profit_2":"' + str.tostring(_tp2, format.mintick) + '"'
+    j += ',"risk_reward":"' + str.tostring(_rr, "#.##") + '"'
+    j += ',"trend":"' + _trend + '"'
+    j += ',"confidence":"' + str.tostring(_conf) + '"'
+    j += ',"position_size":"' + str.tostring(_qty, "#.######") + '"'
+    j += ',"time":"' + str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ssZ", "UTC") + '"'
+    j += ',"strategy":"Smart Zone Trading Bot"'
+    if webhookSecret != ""
+        j += ',"secret":"' + webhookSecret + '"'
+    j += "}"
+    j
+
+// Gambar paket garis + label satu sinyal
+f_drawSignal(bool isLong, float _entry, float _sl, float _tp1, float _tp2, int _conf) =>
+    int x2 = bar_index + lineExtend
+    color cDir = isLong ? colBull : colBear
+    f_pushLine(sigLines, line.new(bar_index, _entry, x2, _entry, color = colEntryLn, width = 2), 16)
+    f_pushLine(sigLines, line.new(bar_index, _sl, x2, _sl, color = colBear, style = line.style_dashed, width = 1), 16)
+    f_pushLine(sigLines, line.new(bar_index, _tp1, x2, _tp1, color = colBull, style = line.style_dashed, width = 1), 16)
+    f_pushLine(sigLines, line.new(bar_index, _tp2, x2, _tp2, color = colBull, style = line.style_dashed, width = 1), 16)
+    f_pushLabel(sigLabels, label.new(x2, _entry, "Entry " + str.tostring(_entry, format.mintick), style = label.style_label_left, color = color.new(colEntryLn, 20), textcolor = color.white, size = size.small), 20)
+    f_pushLabel(sigLabels, label.new(x2, _sl, "SL " + str.tostring(_sl, format.mintick), style = label.style_label_left, color = color.new(colBear, 20), textcolor = color.white, size = size.small), 20)
+    f_pushLabel(sigLabels, label.new(x2, _tp1, "TP1 " + str.tostring(_tp1, format.mintick), style = label.style_label_left, color = color.new(colBull, 35), textcolor = color.white, size = size.small), 20)
+    f_pushLabel(sigLabels, label.new(x2, _tp2, "TP2 " + str.tostring(_tp2, format.mintick), style = label.style_label_left, color = color.new(colBull, 20), textcolor = color.white, size = size.small), 20)
+    if isLong
+        f_pushLabel(sigLabels, label.new(bar_index, low, "BUY ▲  " + str.tostring(_conf) + "%", style = label.style_label_up, color = cDir, textcolor = color.white, size = size.normal), 20)
+    else
+        f_pushLabel(sigLabels, label.new(bar_index, high, "SELL ▼  " + str.tostring(_conf) + "%", style = label.style_label_down, color = cDir, textcolor = color.white, size = size.normal), 20)
+
+// =============================================================================
+//  5. LOGIKA UTAMA — hanya pada bar yang sudah CLOSE (anti-repaint)
+// =============================================================================
+if barstate.isconfirmed
+    // ---- 5a. Reset penghitung harian ---------------------------------------
+    if newDay
+        signalsToday := 0
+
+    barsSinceBreakUp := math.min(barsSinceBreakUp + 1, 9999)
+    barsSinceBreakDn := math.min(barsSinceBreakDn + 1, 9999)
+
+    // ---- 5b. Registrasi pivot yang baru terkonfirmasi ----------------------
+    if not na(ph)
+        prevSwingHigh    := lastSwingHigh
+        lastSwingHigh    := ph
+        lastSwingHighBar := bar_index - pivotLen
+        highTaken        := false
+        if showStruct
+            string txt = na(prevSwingHigh) ? "SH" : ph > prevSwingHigh ? "HH" : "LH"
+            f_pushLabel(pivotLabels, label.new(lastSwingHighBar, ph, txt, style = label.style_label_down, color = color.new(color.gray, 80), textcolor = color.new(color.white, 20), size = size.tiny), 24)
+        if showSR
+            f_pushLine(srLines, line.new(lastSwingHighBar, ph, bar_index + 10, ph, color = color.new(colBear, 60), style = line.style_dotted), 8)
+
+    if not na(pl)
+        prevSwingLow    := lastSwingLow
+        lastSwingLow    := pl
+        lastSwingLowBar := bar_index - pivotLen
+        lowTaken        := false
+        if showStruct
+            string txt = na(prevSwingLow) ? "SL" : pl > prevSwingLow ? "HL" : "LL"
+            f_pushLabel(pivotLabels, label.new(lastSwingLowBar, pl, txt, style = label.style_label_up, color = color.new(color.gray, 80), textcolor = color.new(color.white, 20), size = size.tiny), 24)
+        if showSR
+            f_pushLine(srLines, line.new(lastSwingLowBar, pl, bar_index + 10, pl, color = color.new(colBull, 60), style = line.style_dotted), 8)
+
+    // ---- 5c. Break of Structure / Change of Character -----------------------
+    bool breakUp = not na(lastSwingHigh) and not highTaken and close > lastSwingHigh
+    bool breakDn = not na(lastSwingLow) and not lowTaken and close < lastSwingLow
+
+    if breakUp
+        highTaken := true
+        bool isChoch = structTrend == -1
+        structTrend := 1
+        barsSinceBreakUp := 0
+        if showStruct
+            f_pushLine(structLines, line.new(lastSwingHighBar, lastSwingHigh, bar_index, lastSwingHigh, color = color.new(colBull, 30), style = line.style_dashed), 10)
+            f_pushLabel(structLabels, label.new(bar_index, lastSwingHigh, isChoch ? "CHoCH" : "BOS", style = label.style_label_down, color = color.new(colBull, 25), textcolor = color.white, size = size.tiny), 10)
+        // Order block bullish: candle bearish terakhir sebelum dorongan naik
+        int obIdx = -1
+        for i = 1 to obLookback
+            if close[i] < open[i]
+                obIdx := i
+                break
+        if obIdx > 0
+            float zTop = math.max(open[obIdx], close[obIdx])
+            float zBot = low[obIdx]
+            if not f_overlaps(demandZones, zTop, zBot)
+                f_makeZone(demandZones, zTop, zBot, bar_index - obIdx, true)
+
+    if breakDn
+        lowTaken := true
+        bool isChoch = structTrend == 1
+        structTrend := -1
+        barsSinceBreakDn := 0
+        if showStruct
+            f_pushLine(structLines, line.new(lastSwingLowBar, lastSwingLow, bar_index, lastSwingLow, color = color.new(colBear, 30), style = line.style_dashed), 10)
+            f_pushLabel(structLabels, label.new(bar_index, lastSwingLow, isChoch ? "CHoCH" : "BOS", style = label.style_label_up, color = color.new(colBear, 25), textcolor = color.white, size = size.tiny), 10)
+        // Order block bearish: candle bullish terakhir sebelum dorongan turun
+        int obIdx = -1
+        for i = 1 to obLookback
+            if close[i] > open[i]
+                obIdx := i
+                break
+        if obIdx > 0
+            float zTop = high[obIdx]
+            float zBot = math.min(open[obIdx], close[obIdx])
+            if not f_overlaps(supplyZones, zTop, zBot)
+                f_makeZone(supplyZones, zTop, zBot, bar_index - obIdx, false)
+
+    // ---- 5d. Kelola zona: perpanjang yang aktif, matikan yang tertembus ------
+    if array.size(demandZones) > 0
+        for i = array.size(demandZones) - 1 to 0
+            Zone z = array.get(demandZones, i)
+            if z.active
+                box.set_right(z.bx, bar_index + 3)
+                if close < z.bot
+                    z.active := false
+                    if showZones
+                        box.set_bgcolor(z.bx, color.new(color.gray, 94))
+                        box.set_border_color(z.bx, color.new(color.gray, 75))
+    if array.size(supplyZones) > 0
+        for i = array.size(supplyZones) - 1 to 0
+            Zone z = array.get(supplyZones, i)
+            if z.active
+                box.set_right(z.bx, bar_index + 3)
+                if close > z.top
+                    z.active := false
+                    if showZones
+                        box.set_bgcolor(z.bx, color.new(color.gray, 94))
+                        box.set_border_color(z.bx, color.new(color.gray, 75))
+
+    // ---- 5e. Update status sinyal yang sedang berjalan -----------------------
+    // Catatan: jika SL dan TP tersentuh pada bar yang sama, SL didahulukan
+    // (asumsi konservatif — kita tidak tahu urutan intrabar tanpa data tick).
+    if activeDir == 1
+        if low <= actSL
+            actStatus := "SL HIT ❌"
+            activeDir := 0
+        else if high >= actTP2
+            actStatus := "TP2 HIT ✅"
+            activeDir := 0
+        else if high >= actTP1 and actStatus == "AKTIF"
+            actStatus := "TP1 HIT ✅"
+        else if bar_index - actBar > timeoutBars
+            actStatus := "EXPIRED"
+            activeDir := 0
+    else if activeDir == -1
+        if high >= actSL
+            actStatus := "SL HIT ❌"
+            activeDir := 0
+        else if low <= actTP2
+            actStatus := "TP2 HIT ✅"
+            activeDir := 0
+        else if low <= actTP1 and actStatus == "AKTIF"
+            actStatus := "TP1 HIT ✅"
+        else if bar_index - actBar > timeoutBars
+            actStatus := "EXPIRED"
+            activeDir := 0
+
+    // ---- 5f. Deteksi sinyal baru ------------------------------------------------
+    bool gateCommon = masterEnable and activeDir == 0 and signalsToday < maxSignalsDay and bar_index - lastSignalBar >= cooldownBars and atrOk and candleOk and volOk and inSession
+
+    // ================================ LONG =====================================
+    if gateCommon and enableBuy
+        Zone zL = f_findDemand()
+        bool trendOkL = trendDir == 1 or (allowRange and trendDir == 0 and close < eqLevel)
+        bool rsiOkL   = not useRsiFilter or rsiVal < rsiOb
+        bool mtfOkL   = not useMtf or mtfTrend == 1
+        if not na(zL) and trendOkL and rsiOkL and mtfOkL and confirmBull and close <= zL.top + lateAtrMult * atrVal
+            float entryL = close
+            // SL swing: dasar zona; pakai swing low hanya jika sedikit di bawah
+            // zona (proteksi liquidity sweep tanpa memperlebar SL berlebihan)
+            float slBaseL = zL.bot
+            if not na(lastSwingLow) and lastSwingLow < zL.bot and zL.bot - lastSwingLow <= atrVal
+                slBaseL := lastSwingLow
+            float slL = slMode == "ATR Murni" ? entryL - slAtrMult * atrVal : slBaseL - swingBufAtr * atrVal
+            float riskL = entryL - slL
+            bool slOkL = riskL > 0 and riskL <= maxSlAtrMult * atrVal
+            // RR ke struktur: swing high terakhir tidak boleh memotong target
+            bool headroomL = na(lastSwingHigh) or lastSwingHigh <= entryL or (lastSwingHigh - entryL) >= minRR * riskL
+            if slOkL and headroomL
+                // ---- Skor confidence (confluence opsional, dinormalisasi) ----
+                float sc = 0.0
+                float scMax = 60.0
+                sc += barsSinceBreakUp <= 10 ? 20 : barsSinceBreakUp <= 20 ? 10 : 0
+                sc += engulfBull ? 20 : strongCloseBull ? 15 : 10
+                sc += not na(volume) and volume > 1.5 * volMa ? 10 : 0
+                sc += rsiVal < 60 ? 10 : 0
+                if usePremDisc
+                    scMax += 20
+                    sc += close < eqLevel ? 20 : 0
+                if useMtf
+                    scMax += 20
+                    sc += mtfTrend == 1 ? 20 : 0
+                int confL = math.round(30 + 70 * sc / scMax)
+                if confL >= confThreshold
+                    float tp1L = entryL + tp1RR * riskL
+                    float tp2L = entryL + tp2RR * riskL
+                    float qtyL = riskMoney / riskL
+                    zL.used := true
+                    box.set_right(zL.bx, bar_index)
+                    activeDir := 1
+                    actEntry := entryL
+                    actSL := slL
+                    actTP1 := tp1L
+                    actTP2 := tp2L
+                    actQty := qtyL
+                    actConf := confL
+                    actBar := bar_index
+                    actSide := "BUY"
+                    actStatus := "AKTIF"
+                    actTime := str.format_time(time_close, "dd MMM HH:mm", syminfo.timezone)
+                    signalsToday += 1
+                    lastSignalBar := bar_index
+                    f_drawSignal(true, entryL, slL, tp1L, tp2L, confL)
+                    alert(f_json("BUY", entryL, slL, tp1L, tp2L, tp2RR, trendText, confL, qtyL), alert.freq_once_per_bar)
+
+    // ================================ SHORT ====================================
+    if gateCommon and enableSell and activeDir == 0
+        Zone zS = f_findSupply()
+        bool trendOkS = trendDir == -1 or (allowRange and trendDir == 0 and close > eqLevel)
+        bool rsiOkS   = not useRsiFilter or rsiVal > rsiOs
+        bool mtfOkS   = not useMtf or mtfTrend == -1
+        if not na(zS) and trendOkS and rsiOkS and mtfOkS and confirmBear and close >= zS.bot - lateAtrMult * atrVal
+            float entryS = close
+            float slBaseS = zS.top
+            if not na(lastSwingHigh) and lastSwingHigh > zS.top and lastSwingHigh - zS.top <= atrVal
+                slBaseS := lastSwingHigh
+            float slS = slMode == "ATR Murni" ? entryS + slAtrMult * atrVal : slBaseS + swingBufAtr * atrVal
+            float riskS = slS - entryS
+            bool slOkS = riskS > 0 and riskS <= maxSlAtrMult * atrVal
+            bool headroomS = na(lastSwingLow) or lastSwingLow >= entryS or (entryS - lastSwingLow) >= minRR * riskS
+            if slOkS and headroomS
+                float sc = 0.0
+                float scMax = 60.0
+                sc += barsSinceBreakDn <= 10 ? 20 : barsSinceBreakDn <= 20 ? 10 : 0
+                sc += engulfBear ? 20 : strongCloseBear ? 15 : 10
+                sc += not na(volume) and volume > 1.5 * volMa ? 10 : 0
+                sc += rsiVal > 40 ? 10 : 0
+                if usePremDisc
+                    scMax += 20
+                    sc += close > eqLevel ? 20 : 0
+                if useMtf
+                    scMax += 20
+                    sc += mtfTrend == -1 ? 20 : 0
+                int confS = math.round(30 + 70 * sc / scMax)
+                if confS >= confThreshold
+                    float tp1S = entryS - tp1RR * riskS
+                    float tp2S = entryS - tp2RR * riskS
+                    float qtyS = riskMoney / riskS
+                    zS.used := true
+                    box.set_right(zS.bx, bar_index)
+                    activeDir := -1
+                    actEntry := entryS
+                    actSL := slS
+                    actTP1 := tp1S
+                    actTP2 := tp2S
+                    actQty := qtyS
+                    actConf := confS
+                    actBar := bar_index
+                    actSide := "SELL"
+                    actStatus := "AKTIF"
+                    actTime := str.format_time(time_close, "dd MMM HH:mm", syminfo.timezone)
+                    signalsToday += 1
+                    lastSignalBar := bar_index
+                    f_drawSignal(false, entryS, slS, tp1S, tp2S, confS)
+                    alert(f_json("SELL", entryS, slS, tp1S, tp2S, tp2RR, trendText, confS, qtyS), alert.freq_once_per_bar)
+
+// =============================================================================
+//  6. ALERT DINI ZONA (opsional, boleh intrabar — hanya info, bukan sinyal)
+// =============================================================================
+// Scan zona sekali per sisi lalu dipakai ulang (hindari scan array ganda per tick)
+Zone ztBuy  = alertZoneTouch and masterEnable and enableBuy and activeDir == 0 ? f_findDemand() : na
+Zone ztSell = alertZoneTouch and masterEnable and enableSell and activeDir == 0 ? f_findSupply() : na
+
+if not na(ztBuy)
+    alert('{"type":"ZONE_TOUCH","side":"BUY","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","zone_top":"' + str.tostring(ztBuy.top, format.mintick) + '","zone_bottom":"' + str.tostring(ztBuy.bot, format.mintick) + '","time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssZ", "UTC") + '"' + (webhookSecret != "" ? ',"secret":"' + webhookSecret + '"' : "") + "}", alert.freq_once_per_bar)
+if not na(ztSell)
+    alert('{"type":"ZONE_TOUCH","side":"SELL","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","zone_top":"' + str.tostring(ztSell.top, format.mintick) + '","zone_bottom":"' + str.tostring(ztSell.bot, format.mintick) + '","time":"' + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssZ", "UTC") + '"' + (webhookSecret != "" ? ',"secret":"' + webhookSecret + '"' : "") + "}", alert.freq_once_per_bar)
+
+// =============================================================================
+//  7. PLOT EMA
+// =============================================================================
+plot(showEmas ? emaFast : na, "EMA 50", color = color.new(color.orange, 20), linewidth = 1)
+plot(showEmas ? emaSlow : na, "EMA 200", color = color.new(#2962ff, 20), linewidth = 2)
+
+// =============================================================================
+//  8. PANEL DASHBOARD
+// =============================================================================
+panelPos = panelPosInp == "Kanan Atas" ? position.top_right : panelPosInp == "Kanan Bawah" ? position.bottom_right : panelPosInp == "Kiri Atas" ? position.top_left : position.bottom_left
+
+var table panel = table.new(panelPos, 2, 13, bgcolor = color.new(#131722, 15), border_width = 1, border_color = color.new(color.gray, 75), frame_width = 1, frame_color = color.new(color.gray, 60))
+
+if showPanel and barstate.islast
+    color cTrend = trendDir == 1 ? colBull : trendDir == -1 ? colBear : color.gray
+    color cHead  = color.new(#131722, 0)
+    int filterOkCount = (atrOk ? 1 : 0) + (candleOk ? 1 : 0) + (volOk ? 1 : 0) + (inSession ? 1 : 0) + (trendVis ? 1 : 0) + (not useMtf or mtfTrend == trendDir ? 1 : 0)
+    table.cell(panel, 0, 0, "SMART ZONE BOT", text_color = color.white, text_size = size.small, bgcolor = cHead)
+    table.cell(panel, 1, 0, masterEnable ? "v1 • ON" : "v1 • OFF", text_color = masterEnable ? colBull : colBear, text_size = size.small, bgcolor = cHead)
+    table.cell(panel, 0, 1, "Trend", text_color = color.silver, text_size = size.tiny)
+    table.cell(panel, 1, 1, trendText, text_color = cTrend, text_size = size.tiny)
+    table.cell(panel, 0, 2, "Status", text_color = color.silver, text_size = size.tiny)
+    table.cell(panel, 1, 2, actStatus, text_color = actStatus == "AKTIF" ? color.yellow : color.white, text_size = size.tiny)
+    table.cell(panel, 0, 3, "Sinyal", text_color = color.silver, text_size = size.tiny)
+    table.cell(panel, 1, 3, actSide + (actSide != "-" ? " @ " + actTime : ""), text_color = actSide == "BUY" ? colBull : actSide == "SELL" ? colBear : color.white, text_size = size.tiny)
+    table.cell(panel, 0, 4, "Entry", text_color = color.silver, text_size = size.tiny)
+    table.cell(panel, 1, 4, na(actEntry) ? "-" : str.tostring(actEntry, format.mintick), text_color = color.white, text_size = size.tiny)
+    table.cell(panel, 0, 5, "Stop loss", text_color = color.silver, text_size = size.tiny)
+    table.cell(panel, 1, 5, na(actSL) ? "-" : str.tostring(actSL, format.mintick), text_color = colBear, text_size = size.tiny)
+    table.cell(panel, 0, 6, "TP1 (" + str.tostring(tp1RR, "#.#") + "R)", text_color = color.silver, text_size = size.tiny)
+    table.cell(panel, 1, 6, na(actTP1) ? "-" : str.tostring(actTP1, format.mintick), text_color = colBull, text_size = size.tiny)
+    table.cell(panel, 0, 7, "TP2 (" + str.tostring(tp2RR, "#.#") + "R)", text_color = color.silver, text_size = size.tiny)
+    table.cell(panel, 1, 7, na(actTP2) ? "-" : str.tostring(actTP2, format.mintick), text_color = colBull, text_size = size.tiny)
+    table.cell(panel, 0, 8, "Risk:Reward", text_color = color.silver, text_size = size.tiny)
+    table.cell(panel, 1, 8, "1 : " + str.tostring(tp2RR, "#.##"), text_color = color.white, text_size = size.tiny)
+    table.cell(panel, 0, 9, "Confidence", text_color = color.silver, text_size = size.tiny)
+    table.cell(panel, 1, 9, activeDir != 0 or actSide != "-" ? str.tostring(actConf) + " / 100" : "-", text_color = color.white, text_size = size.tiny)
+    table.cell(panel, 0, 10, "Est. posisi", text_color = color.silver, text_size = size.tiny)
+    table.cell(panel, 1, 10, na(actQty) ? "-" : str.tostring(actQty, "#.####") + " unit", text_color = color.white, text_size = size.tiny, tooltip = "Estimasi: (modal × risiko%) ÷ jarak SL. Belum memperhitungkan leverage, ukuran kontrak, dan fee — hitung ulang di broker Anda.")
+    table.cell(panel, 0, 11, "Sinyal hari ini", text_color = color.silver, text_size = size.tiny)
+    table.cell(panel, 1, 11, str.tostring(signalsToday) + " / " + str.tostring(maxSignalsDay), text_color = signalsToday >= maxSignalsDay ? colBear : color.white, text_size = size.tiny)
+    table.cell(panel, 0, 12, "Filter", text_color = color.silver, text_size = size.tiny)
+    table.cell(panel, 1, 12, str.tostring(filterOkCount) + " / 6 OK" + (activeDir == 0 and filterOkCount == 6 ? "  ✓ VALID" : ""), text_color = filterOkCount == 6 ? colBull : color.orange, text_size = size.tiny)

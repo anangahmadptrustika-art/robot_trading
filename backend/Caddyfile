@@ -1,0 +1,25 @@
+# =============================================================================
+#  Caddy — reverse proxy + auto-HTTPS untuk Smart Zone Trading Bot
+# -----------------------------------------------------------------------------
+#  {$DOMAIN} diisi dari variabel lingkungan DOMAIN (lihat docker-compose.yml).
+#  Caddy otomatis mengurus sertifikat Let's Encrypt selama:
+#    - DOMAIN sudah mengarah (A record) ke IP publik VPS ini, dan
+#    - port 80 & 443 terbuka.
+# =============================================================================
+{$DOMAIN} {
+	# Teruskan semua request ke service backend di jaringan compose.
+	reverse_proxy backend:8000
+
+	# Log akses ringkas (opsional; berguna untuk audit webhook).
+	log {
+		output stdout
+		format console
+	}
+
+	# Header keamanan dasar.
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+	}
+}

@@ -1,0 +1,14 @@
+# Jangan unggah artefak lokal ke Vercel (build lebih cepat & bersih).
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+*.db
+*.sqlite
+*.sqlite3
+.env
+Dockerfile
+docker-compose.yml
+Caddyfile
+requirements-dev.txt

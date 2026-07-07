@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import Engine, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 logger = logging.getLogger(__name__)
 
@@ -29,19 +30,53 @@ def utcnow_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _normalize_db_url(url: str) -> str:
+    """Samakan skema URL Postgres agar cocok dengan driver psycopg (v3).
+
+    Vercel Postgres / Neon / Supabase sering memberi skema 'postgres://' atau
+    'postgresql://'. SQLAlchemy butuh dialek+driver eksplisit; kita pakai
+    'postgresql+psycopg://' (psycopg v3, tercantum di requirements.txt).
+    """
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + url[len("postgresql://"):]
+    return url
+
+
 def init_engine(database_url: str) -> Engine:
     """Inisialisasi (ulang) engine dan session factory dari URL database."""
     global _engine, _session_factory
     if _engine is not None:
         _engine.dispose()
-    connect_args = {}
-    if database_url.startswith("sqlite"):
+    url = _normalize_db_url(database_url)
+    connect_args: dict = {}
+    engine_kwargs: dict = {"future": True}
+    if url.startswith("sqlite"):
         # TestClient/uvicorn bisa memakai thread berbeda dari thread pembuat koneksi.
         connect_args["check_same_thread"] = False
-    _engine = create_engine(database_url, connect_args=connect_args, future=True)
+    else:
+        # Serverless (mis. Vercel): jangan tahan koneksi antar invocation dan
+        # deteksi koneksi yang sudah mati sebelum dipakai.
+        engine_kwargs["poolclass"] = NullPool
+        engine_kwargs["pool_pre_ping"] = True
+    _engine = create_engine(url, connect_args=connect_args, **engine_kwargs)
     _session_factory = sessionmaker(bind=_engine, autoflush=False, expire_on_commit=False)
-    logger.info("Engine database diinisialisasi: %s", database_url)
+    # Catat skema saja — JANGAN log URL penuh (bisa memuat kredensial).
+    logger.info("Engine database diinisialisasi (%s).", url.split("://", 1)[0])
     return _engine
+
+
+def ensure_initialized(database_url: str) -> None:
+    """Pastikan engine + tabel siap. Aman dipanggil berulang.
+
+    Dipakai jalur serverless (Vercel) yang tidak menjalankan lifespan, di mana
+    inisialisasi harus terjadi malas pada request pertama.
+    """
+    if _session_factory is not None:
+        return
+    init_engine(database_url)
+    create_tables()
 
 
 def get_engine() -> Engine:
@@ -61,7 +96,11 @@ def create_tables() -> None:
 def get_db() -> Iterator[Session]:
     """Dependency FastAPI: satu session per request, selalu ditutup."""
     if _session_factory is None:
-        raise RuntimeError("Session factory belum diinisialisasi. Panggil init_engine() dulu.")
+        # Jalur serverless (Vercel) tanpa lifespan: inisialisasi malas dari settings.
+        from app.config import get_settings
+
+        ensure_initialized(get_settings().DATABASE_URL)
+    assert _session_factory is not None  # dipastikan oleh ensure_initialized
     db = _session_factory()
     try:
         yield db

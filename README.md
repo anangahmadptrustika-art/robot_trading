@@ -425,8 +425,10 @@ cd backend
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
-# 2. Pasang dependensi
+# 2. Pasang dependensi (produksi)
 pip install -r requirements.txt
+#    Untuk menjalankan test, pasang juga dependensi dev:
+#    pip install -r requirements-dev.txt
 
 # 3. Siapkan konfigurasi
 cp .env.example .env
@@ -445,9 +447,10 @@ curl http://localhost:8000/health
 # {"status":"ok","mode":"paper","kill_switch":false}
 ```
 
-Jalankan test:
+Jalankan test (butuh `requirements-dev.txt`):
 
 ```bash
+pip install -r requirements-dev.txt
 pytest
 ```
 
@@ -463,6 +466,7 @@ TradingView hanya bisa mengirim ke URL publik (port 80/443). Dua opsi:
 
   Pakai URL `https://xxxx.ngrok.app/webhook/tradingview` di alert. Ingat: URL ngrok gratis **berubah setiap restart** — alert harus diperbarui.
 - **Produksi — VPS + HTTPS otomatis (Docker Compose):** folder `backend/` sudah berisi `Dockerfile`, `docker-compose.yml`, dan `Caddyfile` untuk deploy satu perintah dengan sertifikat TLS otomatis (Let's Encrypt via Caddy). Panduan langkah demi langkah: **[docs/06-deploy-vps.md](docs/06-deploy-vps.md)**. Alternatif tanpa Docker (systemd + Caddy manual) juga ada di sana.
+- **Serverless — Vercel:** backend juga siap deploy ke Vercel (`backend/api/index.py` + `backend/vercel.json`). **Catatan penting:** Vercel serverless **wajib memakai Postgres** (Vercel Postgres/Neon/Supabase), bukan SQLite, karena filesystem-nya sementara. Panduan lengkap: **[docs/07-deploy-vercel.md](docs/07-deploy-vercel.md)**.
 
 ## 9. Cara Menghubungkan ke Telegram
 

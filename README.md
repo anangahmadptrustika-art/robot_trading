@@ -462,7 +462,7 @@ TradingView hanya bisa mengirim ke URL publik (port 80/443). Dua opsi:
   ```
 
   Pakai URL `https://xxxx.ngrok.app/webhook/tradingview` di alert. Ingat: URL ngrok gratis **berubah setiap restart** — alert harus diperbarui.
-- **Produksi — VPS + reverse proxy HTTPS:** jalankan uvicorn di VPS (via systemd/docker), pasang Nginx atau Caddy sebagai reverse proxy dengan sertifikat TLS (Let's Encrypt), arahkan domain Anda, dan set `TRUST_PROXY_HEADERS=true` di `.env` hanya jika proxy Anda menimpa header `X-Forwarded-For`. Contoh konfigurasi ada di [docs/03-backend.md](docs/03-backend.md#8-deployment-singkat).
+- **Produksi — VPS + HTTPS otomatis (Docker Compose):** folder `backend/` sudah berisi `Dockerfile`, `docker-compose.yml`, dan `Caddyfile` untuk deploy satu perintah dengan sertifikat TLS otomatis (Let's Encrypt via Caddy). Panduan langkah demi langkah: **[docs/06-deploy-vps.md](docs/06-deploy-vps.md)**. Alternatif tanpa Docker (systemd + Caddy manual) juga ada di sana.
 
 ## 9. Cara Menghubungkan ke Telegram
 

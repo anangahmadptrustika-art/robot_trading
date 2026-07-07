@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+*.db
+*.sqlite
+*.sqlite3
+.env
+.git/
+Dockerfile
+docker-compose.yml
+Caddyfile
